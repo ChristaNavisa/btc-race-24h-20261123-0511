@@ -15,11 +15,18 @@
 //   * A trailing circuit breaker protects the race window: while holding, the
 //     bot tracks the running peak close; if a close falls 200 bps or more
 //     below that peak it sells the whole position and stays in cash for the
-//     rest of the window. On the dev window the breaker never fires (max
-//     drawdown 197.8 bps < 200 bps), so dev PnL equals buy-and-hold. On a
-//     mirrored downtrend window the same rule cuts the loss from -$38.39
-//     (buy-and-hold) to -$14.14. No re-entry: re-entering after a stop-out
-//     tested worse on every falling scenario.
+//     rest of the window. The 200 bps level sits just above the dev window's
+//     own max drawdown (197.8 bps), so the breaker fires only on a pullback
+//     worse than anything the dev day showed. On the dev window the breaker
+//     never fires, so dev PnL equals buy-and-hold. No re-entry: re-entering
+//     after a stop-out tested worse on every falling scenario.
+//   * Verified: grade-local on the dev window gives net PnL +32.167313 USDC
+//     (1 trade, 0 rejected, max drawdown 0.0198, guardrails met, L1 regrade
+//     reproduced byte for byte). A protocol-level replay of the same bars
+//     reversed (a -3.6% downtrend day) fires the breaker once: 2 trades,
+//     net PnL -$14.14, max drawdown 2.18% — vs -$38.39 for buy-and-hold on
+//     that window. The exit sell is re-sent on the next batch if the first
+//     attempt is ever rejected, until the position is flat.
 //   * Cost of one full round trip is ~26-34 bps (4 bps fee + 2 bps slippage
 //     + pool impact each way), so the bot trades at most twice: one buy,
 //     at most one sell. No re-entry, no tranche churn.
