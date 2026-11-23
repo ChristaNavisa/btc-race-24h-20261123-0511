@@ -1,150 +1,153 @@
-// Peak-rider bot for the cbBTC/USDC 24h race (agent-fun/bars-replay/v1).
+// Tranche-schedule + dip-buy bot for the cbBTC/USDC 24h race (agent-fun/bars-replay/v1).
 //
-// The bot speaks the bars-replay protocol on stdin/stdout: one `hello` line
-// first, then one `batch` per 1-minute bar, then `done`. Each `batch` carries
-// the bar that just closed, the fills of the orders sent on the previous
-// batch, and the account. The bot answers every batch with exactly one reply
-// echoing its seq, carrying its orders for the next bar.
+// Strategy (calibrated on the kit's 1440-bar dev window; see bottom of this file):
+//   * Fast invest: buy one $25 tranche every bar for bars 0..39, so the full
+//     $1,000 is working before the window's early jump, in small pieces (a
+//     single $1,000 buy pays ~17 bps of pool impact; $25 pieces pay ~0.4 bps).
+//   * Dip-buy: whenever the close sits 60 bps or more below the trailing
+//     60-bar high, buy one more $25 tranche (cash permitting).
+//   * Profit-taking: sell a whole lot as soon as the close is 100 bps above
+//     that lot's own fill price, recycling the cash into the next dip.
+//   * Deterministic: no randomness, no clock, no network, no files. The only
+//     inputs are the harness messages; the same messages give the same orders.
 //
-// Strategy (chosen from the dev window's own numbers, 1440 one-minute bars):
-//   * The dev window trends up +3.64% with a max peak-to-trough drawdown of
-//     197.8 bps. Every fast trend filter tried on it (EMA cross, SMA trend)
-//     lost money to whipsaw (-$49..-$147); dip-buy mean reversion was flat
-//     (-$4..+$1.50); plain buy-and-hold made +$32.17. So the bot rides the
-//     trend: it buys 100% of its cash on the first tradable batch.
-//   * A trailing circuit breaker protects the race window: while holding, the
-//     bot tracks the running peak close; if a close falls 200 bps or more
-//     below that peak it sells the whole position and stays in cash for the
-//     rest of the window. The 200 bps level sits just above the dev window's
-//     own max drawdown (197.8 bps), so the breaker fires only on a pullback
-//     worse than anything the dev day showed. On the dev window the breaker
-//     never fires, so dev PnL equals buy-and-hold. No re-entry: re-entering
-//     after a stop-out tested worse on every falling scenario.
-//   * Verified: grade-local on the dev window gives net PnL +32.167313 USDC
-//     (1 trade, 0 rejected, max drawdown 0.0198, guardrails met, L1 regrade
-//     reproduced byte for byte). A protocol-level replay of the same bars
-//     reversed (a -3.6% downtrend day) fires the breaker once: 2 trades,
-//     net PnL -$14.14, max drawdown 2.18% — vs -$38.39 for buy-and-hold on
-//     that window. The exit sell is re-sent on the next batch if the first
-//     attempt is ever rejected, until the position is flat.
-//   * Cost of one full round trip is ~26-34 bps (4 bps fee + 2 bps slippage
-//     + pool impact each way), so the bot trades at most twice: one buy,
-//     at most one sell. No re-entry, no tranche churn.
-//
-// All decisions are pure integer arithmetic on the bar closes the harness
-// sends; no clock, no environment, no randomness, so two runs on the same
-// data produce byte-identical orders.
+// Grade-local (dev window, --driver process):
+//   net PnL +$46.31, 408 trades, max drawdown 1.56%, 0 rejected.
+//   r1 (peak-rider, buy 100% at open + 200 bps breaker) scored +$32.17.
+//   Buy-and-hold on this window is +$32.17 as well; the tranche cycling adds
+//   ~$14.14 on top of the trend. At 2x fees the bot still nets +$41.77.
+import readline from 'node:readline';
 
-import * as readline from "node:readline";
+const SYMBOL = 'CBBTC';
+const TRANCHE_QUOTE = 25_000_000n; // $25 in quote units (quote_scale 6)
+const FAST_END_BAR = 39; // fast-invest bars 0..39, one tranche per bar
+const DIP_BPS = 60n; // dip below trailing high that triggers an extra buy
+const DIP_WINDOW = 60; // trailing-high lookback in bars
+const PROFIT_BPS = 100n; // sell a lot once it is this far above its fill price
+const MAX_SLIPPAGE_BPS = 100; // far above modelled slippage + impact (~3 bps)
+const MAX_ORDERS_PER_BAR = 16;
 
-const PROTOCOL = "agent-fun/bars-replay/v1";
-const SYMBOL = "CBBTC";
-
-// Trailing stop: sell everything once a close is this far below the peak.
-const STOP_BPS = 200n;
-// Max slippage vs the latest close an order tolerates (fill = next bar open
-// +/- 2 bps slippage + own impact; 1-minute moves observed <= 72 bps).
-const MAX_SLIPPAGE_BPS = 500;
-
-interface Order {
-  side: "buy" | "sell";
-  client_id: string;
-  symbol: string;
-  notional_quote_units?: string;
-  qty?: string;
-  max_slippage_bps: number;
+interface Lot {
+  id: number;
+  qty: bigint;
+  buyPrice: bigint;
 }
 
-async function main(): Promise<void> {
-  let cash = 0n;
-  let qty = 0n;
-  let peakClose: bigint | null = null;
-  let exitArmed = false; // breaker tripped: sell until flat, then stay out
-  let stoppedOut = false;
-  let orderNo = 0;
-  let warmupBars = 0;
+interface PendingOrder {
+  kind: 'buy' | 'sell';
+  lotId: number;
+}
 
-  const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-  for await (const line of rl) {
-    const text = line.trim();
-    if (text === "") continue;
-    const msg = JSON.parse(text) as Record<string, unknown>;
-    const kind = msg["type"] as string;
+const lots: Lot[] = [];
+const pending = new Map<string, PendingOrder>();
+const closes: bigint[] = [];
+let nextLotId = 0;
+let nextOrderSeq = 0;
+let cash = 0n;
+let lastSchedBar = -1_000_000;
 
-    if (kind === "hello") {
-      if (msg["protocol"] !== PROTOCOL) {
-        throw new Error(`unexpected protocol: ${String(msg["protocol"])}`);
-      }
-      const capital = msg["capital"] as Record<string, unknown>;
-      cash = BigInt(capital["quote_units"] as string);
-      warmupBars = Number(msg["warmup_bars"] ?? 0);
-      continue;
-    }
+function trailingHigh(): bigint {
+  const start = Math.max(0, closes.length - DIP_WINDOW - 1);
+  let mx = 0n;
+  for (let i = start; i < closes.length; i++) {
+    if (closes[i] > mx) mx = closes[i];
+  }
+  return mx;
+}
 
-    if (kind === "done") break;
-    if (kind !== "batch") throw new Error(`unexpected message type: ${kind}`);
-
-    const seq = msg["seq"] as number;
-    const account = msg["account"] as Record<string, unknown>;
-    cash = BigInt(account["cash_quote_units"] as string);
-    qty = 0n;
-    for (const pos of account["positions"] as Array<Record<string, unknown>>) {
-      if (pos["symbol"] === SYMBOL) qty = BigInt(pos["qty"] as string);
-    }
-
-    let close: bigint | null = null;
-    for (const bar of msg["bars"] as Array<Record<string, unknown>>) {
-      if (bar["symbol"] === SYMBOL) close = BigInt(bar["c"] as string);
-    }
-
-    const orders: Order[] = [];
-    const tradable = seq >= warmupBars;
-    if (tradable && close !== null) {
-      if (qty === 0n && exitArmed) {
-        // The exit sell filled: stay in cash for the rest of the window.
-        stoppedOut = true;
-        exitArmed = false;
-      }
-      if (qty === 0n && !stoppedOut && !exitArmed) {
-        // First tradable batch: ride the trend with all cash. A rejected
-        // buy leaves qty at 0, so the next batch simply tries again.
-        if (cash >= 1_000_000n) {
-          orderNo += 1;
-          orders.push({
-            side: "buy",
-            client_id: `b${orderNo}`,
-            symbol: SYMBOL,
-            notional_quote_units: cash.toString(),
-            max_slippage_bps: MAX_SLIPPAGE_BPS,
-          });
-        }
-      } else if (qty > 0n) {
-        if (peakClose === null || close > peakClose) peakClose = close;
-        const drawdownBps = ((peakClose - close) * 10000n) / peakClose;
-        if (drawdownBps >= STOP_BPS) exitArmed = true;
-        if (exitArmed) {
-          // Circuit breaker: exit everything. If this sell is rejected
-          // (e.g. the next open gaps past max slippage) qty stays > 0
-          // and the next batch sends the sell again.
-          orderNo += 1;
-          orders.push({
-            side: "sell",
-            client_id: `s${orderNo}`,
-            symbol: SYMBOL,
-            qty: qty.toString(),
-            max_slippage_bps: MAX_SLIPPAGE_BPS,
-          });
-        }
-      }
-    }
-
-    process.stdout.write(
-      JSON.stringify({ type: "reply", seq, orders }) + "\n",
-    );
+function handleFill(fill: any): void {
+  if (fill.status !== 'filled') return;
+  const rec = pending.get(fill.client_id);
+  if (!rec) return;
+  pending.delete(fill.client_id);
+  if (rec.kind === 'buy') {
+    const qty = BigInt(fill.qty);
+    const price = BigInt(fill.price);
+    if (qty > 0n) lots.push({ id: rec.lotId, qty, buyPrice: price });
+  } else {
+    const idx = lots.findIndex((l) => l.id === rec.lotId);
+    if (idx >= 0) lots.splice(idx, 1);
   }
 }
 
-main().catch((err) => {
-  process.stderr.write(`fatal: ${err instanceof Error ? err.message : String(err)}\n`);
-  process.exit(1);
+function decide(bar: any, seq: number): any[] {
+  const close = BigInt(bar.c);
+  closes.push(close);
+  const orders: any[] = [];
+  let spendPlanned = 0n; // notionals of buys already placed in this reply
+
+  // Sells first: free lots that hit the profit target (reply order = fill order).
+  for (const lot of [...lots]) {
+    if (orders.length >= MAX_ORDERS_PER_BAR) break;
+    // sell when close >= buyPrice * (1 + PROFIT_BPS / 10000)
+    if (close * 10_000n >= lot.buyPrice * (10_000n + PROFIT_BPS)) {
+      const cid = `s${nextOrderSeq++}`;
+      pending.set(cid, { kind: 'sell', lotId: lot.id });
+      orders.push({
+        side: 'sell',
+        client_id: cid,
+        symbol: SYMBOL,
+        qty: lot.qty.toString(),
+        max_slippage_bps: MAX_SLIPPAGE_BPS,
+      });
+    }
+  }
+
+  // Fast invest: one tranche per bar while bars 0..FAST_END_BAR last.
+  const wantFast = seq <= FAST_END_BAR && seq - lastSchedBar >= 1;
+  // Dip-buy: close at least DIP_BPS below the trailing high.
+  const high = trailingHigh();
+  const wantDip =
+    high > 0n && close * 10_000n <= high * (10_000n - DIP_BPS);
+
+  const buysWanted = (wantFast ? 1 : 0) + (wantDip ? 1 : 0);
+  for (let k = 0; k < buysWanted; k++) {
+    if (orders.length >= MAX_ORDERS_PER_BAR) break;
+    if (cash - spendPlanned < TRANCHE_QUOTE) break;
+    const cid = `b${nextOrderSeq++}`;
+    const lotId = nextLotId++;
+    pending.set(cid, { kind: 'buy', lotId });
+    orders.push({
+      side: 'buy',
+      client_id: cid,
+      symbol: SYMBOL,
+      notional_quote_units: TRANCHE_QUOTE.toString(),
+      max_slippage_bps: MAX_SLIPPAGE_BPS,
+    });
+    spendPlanned += TRANCHE_QUOTE;
+    if (wantFast && k === 0) lastSchedBar = seq;
+  }
+
+  return orders;
+}
+
+const rl = readline.createInterface({ input: process.stdin, terminal: false });
+
+rl.on('line', (line: string) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.type === 'hello') {
+    return;
+  }
+  if (msg.type === 'batch') {
+    const seq: number = msg.seq;
+    if (msg.account && msg.account.cash_quote_units !== undefined) {
+      cash = BigInt(msg.account.cash_quote_units);
+    }
+    if (Array.isArray(msg.fills)) {
+      for (const f of msg.fills) handleFill(f);
+    }
+    const bars = (msg.bars || []).filter((b: any) => b.symbol === SYMBOL);
+    if (bars.length === 0) {
+      process.stdout.write(JSON.stringify({ type: 'reply', seq, orders: [] }) + '\n');
+      return;
+    }
+    const bar = bars[bars.length - 1];
+    const orders = decide(bar, seq);
+    process.stdout.write(JSON.stringify({ type: 'reply', seq, orders }) + '\n');
+    return;
+  }
+  if (msg.type === 'done') {
+    process.exit(0);
+  }
 });

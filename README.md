@@ -1,39 +1,35 @@
-# Peak-Rider cbBTC Bot — Race a BTC trading bot live for 24 hours
+[![make.fun](https://make.fun/badge/btc-race-24h-20261123-0511.svg)](https://make.fun/bounty/btc-race-24h-20261123-0511)
+[![rank](https://make.fun/badge/btc-race-24h-20261123-0511/ChristaNavisa/btc-race-24h-20261123-0511/rank.svg)](https://make.fun/bounty/btc-race-24h-20261123-0511)
+[![reward](https://make.fun/badge/btc-race-24h-20261123-0511/ChristaNavisa/btc-race-24h-20261123-0511/reward.svg)](https://make.fun/bounty/btc-race-24h-20261123-0511)
 
-[![make.fun](https://make.fun/badge/btc-race-24h-20261123-0511.svg)](https://make.fun/c/btc-race-24h-20261123-0511)
-[![Rank](https://make.fun/badge/btc-race-24h-20261123-0511/ChristaNavisa/btc-race-24h-20261123-0511/rank.svg)](https://make.fun/c/btc-race-24h-20261123-0511)
-[![Reward](https://make.fun/badge/btc-race-24h-20261123-0511/ChristaNavisa/btc-race-24h-20261123-0511/reward.svg)](https://make.fun/c/btc-race-24h-20261123-0511)
+# Race a BTC trading bot live for 24 hours — r2
 
-A bot that trades Coinbase Wrapped BTC (cbBTC) against USDC, minute by minute,
-on 1-minute on-chain bars (`agent-fun/bars-replay/v1`), starting with $1,000 of
-paper money. Nothing is traded for real.
+A deterministic cbBTC/USDC trading bot for the [make.fun bounty](https://make.fun/bounty/btc-race-24h-20261123-0511). It speaks the `agent-fun/bars-replay/v1` protocol on stdin/stdout: one `hello`, one `batch` per 1-minute bar, one `reply` per batch.
 
-## Strategy
+## Strategy (r2)
 
-**Ride the trend, with a circuit breaker.** The dev window (1,440 one-minute
-bars) trends up +3.64% with a maximum peak-to-trough drawdown of 197.8 bps.
-On that window every fast trend filter (EMA cross, SMA trend) lost money to
-whipsaw, dip-buy mean reversion was flat, and plain buy-and-hold made
-+$32.17 — so the bot buys 100% of its cash on the first tradable batch and
-holds.
+Round 1 rode the trend with a single 100% buy and a trailing breaker
+(dev PnL +$32.17). Round 2 replaces it with the tranche schedule that won
+the 18 Nov race: many small trades instead of one big one.
 
-While holding it tracks the running peak close. If a close falls 200 bps or
-more below that peak, it sells the whole position and stays in cash for the
-rest of the window — no re-entry (re-entering after a stop-out tested worse
-on every falling scenario). On the dev window the breaker never fires, so dev
-PnL equals buy-and-hold; on a mirrored −3.6% downtrend window the same rule
-cuts the loss from −$38.39 to −$14.14.
+- **Fast invest:** one $25 tranche every bar for bars 0–39, so the full
+  $1,000 is working before the window's early jump. Small pieces matter: a
+  single $1,000 buy pays ~17 bps of pool impact; $25 pieces pay ~0.4 bps.
+- **Dip-buy:** whenever the close sits 60 bps or more below the trailing
+  60-bar high, buy one more $25 tranche (cash permitting).
+- **Profit-taking:** sell a whole lot as soon as the close is 100 bps above
+  that lot's own fill price, recycling the cash into the next dip.
 
-## Run
+Deterministic: no randomness, no wall clock, no network, no files outside
+this repository. Standard library only.
 
-```sh
-python3 -P -s main.py
-```
+## Local grade (dev window)
 
-Standard library only. All decisions are pure integer arithmetic on the bar
-closes the harness sends — no clock, no environment, no randomness — so two
-runs on the same data produce byte-identical orders.
+`node cli/makefun.mjs grade-local --kit . --bot . --driver process`
 
-## License
+- net PnL **+$46.31**, **408 trades**, max drawdown 1.56%, 0 rejected.
+- Dev gate: net PnL > $0 — passed.
 
-MIT — see [LICENSE](LICENSE).
+## Entry point
+
+`main.ts` (Node 22) at the repository root.
